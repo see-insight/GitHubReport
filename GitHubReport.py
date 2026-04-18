@@ -315,6 +315,7 @@ class Group:
         
         summary = {
             "username": username,
+            "group": self.org,
             "avitar": avitar,
             "commits": 0,
             "lines_added": 0,
@@ -408,7 +409,7 @@ def render_markdown(activity: Dict) -> str:
     """
     lines: List[str] = []
     lines.append(f"![{activity['username']}]({activity['avitar']})")
-    lines.append(f"# GitHub Activity Report: `{activity['username']}`")
+    lines.append(f"# {activity['group']} GitHub Activity Report for `{activity['username']}`")
     lines.append("")
     lines.append("## Summary")
     lines.append("")
@@ -426,8 +427,8 @@ def render_markdown(activity: Dict) -> str:
     for repo, data in activity["per_repo"].items():
         lines.append(f"### `{repo}`")
         lines.append("")
-        lines.append(f"- Commits: {data['commits']}")
         lines.append(f"- Issues opened: {data['issues_opened']}")
+        lines.append(f"- Commits: {data['commits']}")
         lines.append("")
 
         if data["commit_messages"]:
