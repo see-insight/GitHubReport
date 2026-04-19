@@ -1,415 +1,614 @@
 """
-GitHubReport.py
+GitReport.py
 
-A small utility module for generating per-student GitHub activity reports
-for a GitHub organization over a specified date range.
+Platform-agnostic utilities for generating per-student Git
+activity reports over a specified date range.
+
+Currently implemented:
+- GitHubProvider
+
+Planned:
+- GitLabProvider (see TODO markers)
 
 Primary use cases:
 - Course grading
 - Participation auditing
 - Student reflection and feedback
-
-Design goals:
-- Readable, explicit code
-- Minimal magic
-- Easy to extend in a Jupyter or scripting environment
 """
 
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-class Group:
+# ======================================================================
+# Provider abstraction
+# ======================================================================
+
+class ProviderBase:
     """
-    Represents a GitHub organization ("group") and a reporting window.
+    Abstract interface for a Git hosting provider.
 
-    A Group object owns:
-    - Organization name
-    - Authentication token
-    - Date range (semester)
-    - Repository list
+    A Provider is responsible for:
+    - Authentication
+    - API calls
+    - Returning normalized data structures
 
-    Example
-    -------
-    >>> group = Group("see-insight", token, start, end)
-    >>> summary = group.student("colbrydi")
+    Group and reporting code should NEVER depend on
+    whether the provider is GitHub, GitLab, etc.
     """
-
-
-    def __init__(
-        self,
-        org: str,
-        token: str,
-        semester_start: datetime,
-        semester_end: datetime,
-        extra_repos: List[str] | None = None,
-    ) -> None:
-
-        """
-        Initialize a Group.
-
-        Parameters
-        ----------
-        org : str
-            GitHub organization name (e.g. "see-insight")
-        token : str
-            GitHub Personal Access Token
-        semester_start : datetime
-            Start of reporting window (timezone-aware)
-        semester_end : datetime
-            End of reporting window (timezone-aware)
-        """
-        self.org = org
-        self.semester_start = semester_start
-        self.semester_end = semester_end
+    providerurl = ""
     
+    def list_repositories(self) -> List[dict]:
+        raise NotImplementedError
+
+    def list_members(self) -> List[dict]:
+        raise NotImplementedError
+
+    def get_user_commits(
+        self, repo: dict, username: str,
+        start: datetime, end: datetime
+    ) -> List[dict]:
+        raise NotImplementedError
+
+    def get_commit_stats(self, repo: dict, sha: str) -> tuple[int, int]:
+        raise NotImplementedError
+
+    def get_user_issues(
+        self, repo: dict, username: str,
+        start: datetime, end: datetime
+    ) -> List[dict]:
+        raise NotImplementedError
+
+    def get_user_merge_requests(
+        self, repo: dict, username: str,
+        start: datetime, end: datetime
+    ) -> List[dict]:
+        raise NotImplementedError
+
+    def get_user_avatar_url(self, username: str) -> Optional[str]:
+        return None
+
+
+# ======================================================================
+# GitHub provider implementation
+# ======================================================================
+
+class GitHubProvider(ProviderBase):
+    """
+    GitHub REST API implementation of ProviderBase.
+    """
+
+    def __init__(self, org: str, token: str, extra_repos: Optional[List[str]] = None) -> None:
+        self.org = org
+        self.providerurl = "GitHub.com"
+        self.extra_repos = extra_repos or []
+
         self.headers = {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github+json",
         }
-        self.extra_repos = extra_repos or []
-        
+
         self.repos = self._load_repositories()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    
-    def _load_single_repository(self, full_name: str) -> dict:
-        """
-        Load metadata for a single GitHub repository given 'owner/repo'.
-        """
-        url = f"https://api.github.com/repos/{full_name}"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()  
-    
+    # ------------------ helpers ------------------
+
     @staticmethod
     def _iso(dt: datetime) -> str:
-        """
-        Convert datetime to GitHub-compatible ISO string.
-        """
         return dt.isoformat().replace("+00:00", "Z")
 
-    def _github_get_all(self, url: str, params: dict = None) -> List[dict]:
-        """
-        GET all pages from a GitHub REST endpoint.
-
-        Handles GitHub pagination automatically.
-
-        Parameters
-        ----------
-        url : str
-            Base GitHub API endpoint
-        params : dict, optional
-            Query parameters for first request
-
-        Returns
-        -------
-        List[dict]
-            Aggregated JSON responses
-        """
+    def _get_all(self, url: str, params: dict = None) -> List[dict]:
         results: List[dict] = []
-
         while url:
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            results.extend(response.json())
-
-            url = response.links.get("next", {}).get("url")
-            params = None  # only needed for first request
-
+            resp = requests.get(url, headers=self.headers, params=params)
+            resp.raise_for_status()
+            results.extend(resp.json())
+            url = resp.links.get("next", {}).get("url")
+            params = None
         return results
 
+    # ------------------ GitHub API ------------------
 
+    def _load_single_repository(self, full_name: str) -> dict:
+        url = f"https://api.github.com/repos/{full_name}"
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+        return resp.json()
+    
     def _load_repositories(self) -> List[dict]:
         """
-        Load all repositories in the organization, plus any explicitly
-        provided external repositories.
+        Load all repositories visible to the organization, plus any explicitly
+        provided extra repositories, and normalize them to a canonical schema.
         """
         repos: List[dict] = []
     
         # --- Organization repositories ---
         org_url = f"https://api.github.com/orgs/{self.org}/repos"
-        repos.extend(
-            self._github_get_all(
-                org_url,
-                params={"type": "all", "per_page": 100},
-            )
+        raw_repos = self._get_all(
+            org_url,
+            params={"per_page": 100, "type": "all"},
         )
     
-        # --- Explicitly included extra repositories ---
-        for repo_name in self.extra_repos:
-            print(f"Including external repo: {repo_name}")
-            repos.append(self._load_single_repository(repo_name))
+        repos.extend(self._normalize_repo(r) for r in raw_repos)
     
-        # --- Deduplicate by full_name ---
-        unique = {}
-        for repo in repos:
-            unique[repo["full_name"]] = repo
+        # --- Explicitly included external repositories ---
+        for repo_name in self.extra_repos:
+            raw_repo = self._load_single_repository(repo_name)
+            repos.append(self._normalize_repo(raw_repo))
+    
+        # --- Deduplicate by canonical full_name ---
+        unique = {r["full_name"]: r for r in repos}
     
         return list(unique.values())
     
-    # ------------------------------------------------------------------
-    # GitHub queries (scoped per repository)
-    # ------------------------------------------------------------------
-
-    def members(self):
-        members_url = f"https://api.github.com/orgs/{self.org}/members"
-        members = self._github_get_all(
-            members_url,
-            params={"per_page": 100}
-        )
-        return members
+    def _normalize_repo(self, repo: dict) -> dict:
+        """
+        Normalize a GitHub repository object to the canonical schema.
+        """
+        return {
+            "id": repo["full_name"],                   # GitHub uses owner/name
+            "name": repo["name"],
+            "full_name": repo["full_name"],
+            "web_url": repo.get("html_url"),
+            "provider": "github",
+            "raw": repo,
+        }
     
-    def _get_user_commits(
-        self, repo_full_name: str, username: str
-    ) -> List[dict]:
-        """
-        Retrieve commits authored by a user within the semester window.
-        """
-        url = f"https://api.github.com/repos/{repo_full_name}/commits"
-        return self._github_get_all(
+    # ------------------ ProviderBase API ------------------
+
+    def list_repositories(self) -> List[dict]:
+        return self.repos
+
+    def list_members(self) -> List[dict]:
+        url = f"https://api.github.com/orgs/{self.org}/members"
+        return self._get_all(url, params={"per_page": 100})
+
+    def get_user_commits(self, repo: dict, username: str, start: datetime, end: datetime) -> List[dict]:
+        url = f"https://api.github.com/repos/{repo['full_name']}/commits"
+        return self._get_all(
             url,
             params={
                 "author": username,
-                "since": self._iso(self.semester_start),
-                "until": self._iso(self.semester_end),
+                "since": self._iso(start),
+                "until": self._iso(end),
                 "per_page": 100,
             },
         )
 
-    def _get_commit_stats(
-        self, repo_full_name: str, sha: str
-    ) -> tuple[int, int]:
-        """
-        Retrieve line addition/deletion statistics for a single commit.
-        """
-        url = f"https://api.github.com/repos/{repo_full_name}/commits/{sha}"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-
-        stats = response.json().get("stats", {})
+    def get_commit_stats(self, repo: dict, sha: str) -> tuple[int, int]:
+        url = f"https://api.github.com/repos/{repo['full_name']}/commits/{sha}"
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+        stats = resp.json().get("stats", {})
         return stats.get("additions", 0), stats.get("deletions", 0)
 
-    def _get_user_issues(
-        self, repo_full_name: str, username: str
-    ) -> List[dict]:
-        """
-        Retrieve issues *opened* by a user within the semester window.
-        """
-        url = f"https://api.github.com/repos/{repo_full_name}/issues"
-        raw_issues = self._github_get_all(
-            url,
-            params={
-                "state": "all",
-                "since": self._iso(self.semester_start),
-                "per_page": 100,
-            },
-        )
+    def get_user_issues(self, repo: dict, username: str, start: datetime, end: datetime) -> List[dict]:
+        url = f"https://api.github.com/repos/{repo['full_name']}/issues"
+        raw = self._get_all(url, params={"state": "all", "per_page": 100})
 
         issues: List[dict] = []
-
-        for issue in raw_issues:
-            if "pull_request" in issue:
+        for i in raw:
+            if "pull_request" in i:
+                continue
+            if i.get("user", {}).get("login") != username:
                 continue
 
-            if issue.get("user", {}).get("login") != username:
+            created = datetime.fromisoformat(i["created_at"].replace("Z", "+00:00"))
+            if not (start <= created <= end):
                 continue
 
-            created_at = datetime.fromisoformat(
-                issue["created_at"].replace("Z", "+00:00")
-            )
-
-            if not (self.semester_start <= created_at <= self.semester_end):
-                continue
-
-            issues.append(
-                {
-                    "number": issue["number"],
-                    "title": issue["title"],
-                    "created_at": issue["created_at"],
-                    "closed_at": issue.get("closed_at"),
-                    "labels": [label["name"] for label in issue.get("labels", [])],
-                }
-            )
+            issues.append({
+                "number": i["number"],
+                "title": i["title"],
+                "created_at": i["created_at"],
+            })
 
         return issues
 
-    def _get_user_pull_requests(
-        self, repo_full_name: str, username: str
-    ) -> List[dict]:
-        """
-        Retrieve pull requests opened by a user within the semester window.
-        """
-        url = f"https://api.github.com/repos/{repo_full_name}/pulls"
-        raw_prs = self._github_get_all(
-            url,
-            params={"state": "all", "per_page": 100},
-        )
+    def get_user_merge_requests(self, repo: dict, username: str, start: datetime, end: datetime) -> List[dict]:
+        url = f"https://api.github.com/repos/{repo['full_name']}/pulls"
+        raw = self._get_all(url, params={"state": "all", "per_page": 100})
 
         prs: List[dict] = []
-
-        for pr in raw_prs:
+        for pr in raw:
             if pr.get("user", {}).get("login") != username:
                 continue
 
-            created_at = datetime.fromisoformat(
-                pr["created_at"].replace("Z", "+00:00")
-            )
-
-            if not (self.semester_start <= created_at <= self.semester_end):
+            created = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+            if not (start <= created <= end):
                 continue
 
-            prs.append(
-                {
-                    "number": pr["number"],
-                    "title": pr["title"],
-                    "created_at": pr["created_at"],
-                    "merged_at": pr["merged_at"],
-                }
-            )
+            prs.append({
+                "number": pr["number"],
+                "title": pr["title"],
+                "created_at": pr["created_at"],
+                "merged_at": pr.get("merged_at"),
+            })
 
         return prs
 
-
-    def plot_student_activity_calendar(self, activity: dict) -> None:
-        """
-        Plot a GitHub-style activity calendar for a student using
-        the group's semester start and end dates.
-        """
-        plot_semester_activity_calendar(
-            activity,
-            self.semester_start,
-            self.semester_end,
-        )
-    
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def get_user_avatar_url(self, username: str) -> str:
-        """
-        Return the avatar URL for a GitHub user.
-        """
         url = f"https://api.github.com/users/{username}"
         resp = requests.get(url, headers=self.headers)
         resp.raise_for_status()
         return resp.json()["avatar_url"]
-    
-    def student(self, username: str) -> Dict:
-        """
-        Collect and aggregate GitHub activity for a single student.
 
-        Returns a structured dictionary suitable for:
-        - Markdown rendering
-        - Visualization
-        - Further analysis
-        """
+    # TODO: GitLabProvider will implement same interface
+    # TODO: GitLab uses project IDs, merge_requests, and PRIVATE-TOKEN auth
 
-        avitar = self.get_user_avatar_url(username)
+
+# ======================================================================
+# GitLab provider implementation
+# ======================================================================
+
+class GitLabProvider(ProviderBase):
+    """
+    GitLab REST API implementation of ProviderBase.
+
+    NOTE:
+    - Uses project IDs internally
+    - Assumes self.base_url points to your institution's GitLab
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        group_path: str,
+        token: str,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.group_path = group_path
+
+        self.headers = {
+            "PRIVATE-TOKEN": token,
+        }
+        self.providerurl = "gitlab.msu.edu"
         
+        # ✅ REQUIRED: resolve numeric group ID once
+        self.group_id = self._resolve_group_id()
+
+        # ✅ Load projects using numeric ID
+        self.repos = self._load_projects()
+        
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get(self, path: str, params: dict | None = None) -> list[dict]:
+        url = f"{self.base_url}{path}"
+        results: list[dict] = []
+
+        while url:
+            resp = requests.get(url, headers=self.headers, params=params)
+            resp.raise_for_status()
+
+            results.extend(resp.json())
+
+            # GitLab pagination
+            next_page = resp.headers.get("X-Next-Page")
+            if next_page:
+                params = params or {}
+                params["page"] = next_page
+                url = f"{self.base_url}{path}"
+            else:
+                url = None
+
+        return results
+        
+    def _normalize_repo(self, project: dict) -> dict:
+        """
+        Normalize a GitLab project object to the canonical schema.
+        """
+        return {
+            "id": project["id"],                        # numeric (important)
+            "name": project["name"],
+            "full_name": project["path_with_namespace"],
+            "web_url": project.get("web_url"),
+            "provider": "gitlab",
+            "raw": project,
+        }
+
+    def _resolve_group_id(self) -> int:
+        """
+        Resolve the numeric GitLab group ID from a group path.
+        """
+        url = f"{self.base_url}/api/v4/groups/{self.group_path}"
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    # ------------------------------------------------------------------
+    # Required ProviderBase methods
+    # ------------------------------------------------------------------
+
+    def list_repositories(self) -> list[dict]:
+        return self.repos
+    
+    def _load_projects(self) -> list[dict]:
+        """
+        Load all projects in the GitLab group and normalize them
+        to the canonical internal repository schema.
+        """
+        raw_projects = self._get(
+            f"/api/v4/groups/{self.group_id}/projects",
+            params={"per_page": 100},
+        )
+    
+        projects = [self._normalize_repo(p) for p in raw_projects]
+    
+        # Deduplicate by canonical full_name (safety, mirrors GitHubProvider)
+        unique = {p["full_name"]: p for p in projects}
+    
+        return list(unique.values())
+
+    def get_user_commits(
+        self,
+        repo: dict,
+        username: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict]:
+        """
+        Retrieve commits authored by a user within the date window
+        and normalize them to the canonical commit schema.
+        """
+        raw_commits = self._get(
+            f"/api/v4/projects/{repo['id']}/repository/commits",
+            params={
+                "author": username,
+                "since": start.isoformat(),
+                "until": end.isoformat(),
+                "per_page": 100,
+            },
+        )
+    
+        commits: list[dict] = []
+    
+        for c in raw_commits:
+            commits.append(
+                {
+                    # ---- canonical keys expected by Group ----
+                    "sha": c["id"],                    # ⬅️ THIS FIXES THE ERROR
+                    "commit": {
+                        "author": {
+                            "date": c["created_at"]
+                        },
+                        "message": c["message"],
+                    },
+                    # ---- optional metadata ----
+                    "raw": c,
+                }
+            )
+    
+        return commits
+
+    def get_commit_stats(self, repo: dict, sha: str) -> tuple[int, int]:
+        """
+        Retrieve line addition/deletion statistics for a single GitLab commit.
+    
+        NOTE:
+        This endpoint returns a single JSON object (not a list),
+        so we do NOT use _get().
+        """
+        url = f"{self.base_url}/api/v4/projects/{repo['id']}/repository/commits/{sha}"
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+    
+        commit = resp.json()
+        stats = commit.get("stats", {})
+    
+        return stats.get("additions", 0), stats.get("deletions", 0)
+
+
+    # ------------------------------------------------------------------
+    # TODO: issues, merge requests, avatars
+    # ------------------------------------------------------------------
+    
+    def get_user_issues(
+        self,
+        repo: dict,
+        username: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict]:
+        """
+        Retrieve issues opened by a user within the date window
+        for a single GitLab project.
+        """
+        # GitLab endpoint:
+        # GET /projects/:id/issues
+        raw_issues = self._get(
+            f"/api/v4/projects/{repo['id']}/issues",
+            params={
+                "state": "all",
+                "per_page": 100,
+            },
+        )
+    
+        issues: list[dict] = []
+    
+        for issue in raw_issues:
+            # Must be authored by the user
+            if issue.get("author", {}).get("username") != username:
+                continue
+    
+            created_at = datetime.fromisoformat(
+                issue["created_at"].replace("Z", "+00:00")
+            )
+    
+            # Must be created within semester window
+            if not (start <= created_at <= end):
+                continue
+    
+            issues.append(
+                {
+                    "number": issue["iid"],           # project-local issue number
+                    "title": issue["title"],
+                    "created_at": issue["created_at"],
+                    "closed_at": issue.get("closed_at"),
+                }
+            )
+    
+        return issues
+
+    def get_user_merge_requests(
+        self,
+        repo: dict,
+        username: str,
+        start: datetime,
+        end: datetime,
+        ) -> list[dict]:
+        """
+        Retrieve merge requests opened by a user within the date window.
+        """
+        # GitLab endpoint:
+        # GET /projects/:id/merge_requests
+        raw_mrs = self._get(
+            f"/api/v4/projects/{repo['id']}/merge_requests",
+            params={
+                "state": "all",
+                "per_page": 100,
+            },
+        )
+        
+        mrs: list[dict] = []
+        
+        for mr in raw_mrs:
+            # Must be authored by the user
+            if mr.get("author", {}).get("username") != username:
+                continue
+        
+            created_at = datetime.fromisoformat(
+                mr["created_at"].replace("Z", "+00:00")
+            )
+        
+            # Must be created within semester window
+            if not (start <= created_at <= end):
+                continue
+        
+            mrs.append(
+                {
+                    "number": mr["iid"],               # project-local MR number
+                    "title": mr["title"],
+                    "created_at": mr["created_at"],
+                    "merged_at": mr.get("merged_at"),
+                }
+            )
+        
+        return mrs   
+
+# ======================================================================
+# Group: platform-independent reporting logic
+# ======================================================================
+
+class Group:
+    """
+    Semantic reporting layer.
+
+    Owns:
+    - provider (GitHub, GitLab, etc.)
+    - semester window
+    """
+
+    def __init__(self, provider: ProviderBase, start: datetime, end: datetime) -> None:
+        self.provider = provider
+        self.start = start
+        self.end = end
+        self.repos = provider.list_repositories()
+
+    def members(self) -> List[dict]:
+        return self.provider.list_members()
+
+    def student(self, username: str) -> Dict:
+        avatar = self.provider.get_user_avatar_url(username)
+
         summary = {
             "username": username,
-            "group": self.org,
-            "avitar": avitar,
+            "avatar": avatar,
             "commits": 0,
             "lines_added": 0,
             "lines_deleted": 0,
             "issues_opened": 0,
-            "pull_requests_opened": 0,
-            "pull_requests_merged": 0,
+            "merge_requests_opened": 0,
+            "merge_requests_merged": 0,
             "per_repo": {},
         }
 
         for repo in self.repos:
-            repo_name = repo["full_name"]
-            print(f"{repo_name}")
-
-            repo_record = {
+            print(repo["full_name"])
+            
+            record = {
                 "commits": 0,
                 "lines_added": 0,
                 "lines_deleted": 0,
                 "issues_opened": 0,
-                "pull_requests_opened": 0,
-                "pull_requests_merged": 0,
+                "merge_requests_opened": 0,
+                "merge_requests_merged": 0,
                 "commit_messages": [],
                 "issue_context": [],
-                "pr_context": [],
+                "mr_context": [],
             }
 
-            # ---- Commits ----
-            commits = self._get_user_commits(repo_name, username)
-            repo_record["commits"] = len(commits)
+            commits = self.provider.get_user_commits(repo, username, self.start, self.end)
+            record["commits"] = len(commits)
 
-            for commit in commits:
-                additions, deletions = self._get_commit_stats(
-                    repo_name, commit["sha"]
-                )
-                repo_record["lines_added"] += additions
-                repo_record["lines_deleted"] += deletions
-                repo_record["commit_messages"].append(
-                    {
-                        "sha": commit["sha"],
-                        "date": commit["commit"]["author"]["date"],
-                        "message": commit["commit"]["message"].splitlines()[0],
-                    }
-                )
+            for c in commits:
+                add, delete = self.provider.get_commit_stats(repo, c["sha"])
+                record["lines_added"] += add
+                record["lines_deleted"] += delete
+                record["commit_messages"].append({
+                    "date": c["commit"]["author"]["date"],
+                    "message": c["commit"]["message"].splitlines()[0],
+                })
 
-            # ---- Issues ----
-            issues = self._get_user_issues(repo_name, username)
-            repo_record["issues_opened"] = len(issues)
-            repo_record["issue_context"] = issues
+            issues = self.provider.get_user_issues(repo, username, self.start, self.end)
+            record["issues_opened"] = len(issues)
+            record["issue_context"] = issues
 
-            # ---- Pull requests ----
-            prs = self._get_user_pull_requests(repo_name, username)
-            repo_record["pull_requests_opened"] = len(prs)
-            repo_record["pull_requests_merged"] = sum(
-                1 for pr in prs if pr.get("merged_at")
-            )
-            repo_record["pr_context"] = prs
+            mrs = self.provider.get_user_merge_requests(repo, username, self.start, self.end)
+            record["merge_requests_opened"] = len(mrs)
+            record["merge_requests_merged"] = sum(1 for m in mrs if m.get("merged_at"))
+            record["mr_context"] = mrs
 
-            if any(
-                [
-                    repo_record["commits"],
-                    repo_record["issues_opened"],
-                    repo_record["pull_requests_opened"],
-                ]
-            ):
-                summary["per_repo"][repo_name] = repo_record
+            if any(record.values()):
+                summary["per_repo"][repo.get("full_name", repo.get("path_with_namespace"))] = record
 
-            # ---- Aggregate totals ----
-            summary["commits"] += repo_record["commits"]
-            summary["lines_added"] += repo_record["lines_added"]
-            summary["lines_deleted"] += repo_record["lines_deleted"]
-            summary["issues_opened"] += repo_record["issues_opened"]
-            summary["pull_requests_opened"] += repo_record["pull_requests_opened"]
-            summary["pull_requests_merged"] += repo_record[
-                "pull_requests_merged"
-            ]
+            for k in ("commits", "lines_added", "lines_deleted", "issues_opened"):
+                summary[k] += record[k]
+
+            summary["merge_requests_opened"] += record["merge_requests_opened"]
+            summary["merge_requests_merged"] += record["merge_requests_merged"]
 
         return summary
 
-
-
-# ----------------------------------------------------------------------
-# Presentation helpers (kept functional on purpose)
-# ----------------------------------------------------------------------
-
-
-
+    def plot_student_activity_calendar(self, activity: dict) -> None:
+        """
+        Plot a GitHub/GitLab-style activity calendar for a student
+        using the group's semester window.
+        """
+        plot_semester_activity_calendar(
+            activity,
+            self.start,
+            self.end,
+        )
+# ======================================================================
+# Presentation helpers (unchanged, reusable)
+# ======================================================================
 
 def render_markdown(activity: Dict) -> str:
-    """
-    Render a student activity summary as Markdown.
-    """
     lines: List[str] = []
-    lines.append(f"![{activity['username']}]({activity['avitar']})")
-    lines.append(f"# {activity['group']} GitHub Activity Report for `{activity['username']}`")
+
+    if activity.get("avatar"):
+        lines.append(f"![{activity['username']}]({activity['avatar']})")
+
+    lines.append(
+        f"# {activity.get('group','')} Activity Report for `{activity['username']}`"
+    )
     lines.append("")
     lines.append("## Summary")
     lines.append("")
@@ -417,8 +616,8 @@ def render_markdown(activity: Dict) -> str:
     lines.append(f"- Lines added: {activity['lines_added']}")
     lines.append(f"- Lines deleted: {activity['lines_deleted']}")
     lines.append(f"- Issues opened: {activity['issues_opened']}")
-    lines.append(f"- Pull requests opened: {activity['pull_requests_opened']}")
-    lines.append(f"- Pull requests merged: {activity['pull_requests_merged']}")
+    lines.append(f"- Merge requests opened: {activity.get('merge_requests_opened', 0)}")
+    lines.append(f"- Merge requests merged: {activity.get('merge_requests_merged', 0)}")
     lines.append("")
 
     lines.append("## Activity by Repository")
@@ -433,25 +632,23 @@ def render_markdown(activity: Dict) -> str:
 
         if data["commit_messages"]:
             lines.append("**Commits:**\n")
-            for commit in data["commit_messages"]:
-                lines.append(
-                    f"- {commit['date'][:10]} — {commit['message']}"
-                )
+            for c in data["commit_messages"]:
+                lines.append(f"- {c['date'][:10]} — {c['message']}")
             lines.append("")
 
         if data["issue_context"]:
             lines.append("**Issues:**\n")
-            for issue in data["issue_context"]:
-                lines.append(f"- {issue['number']} — {issue['title']}")
+            for i in data["issue_context"]:
+                lines.append(f"- issue #{i['number']} — {i['title']}")
             lines.append("")
 
     return "\n".join(lines)
 
 
 def plot_semester_activity_calendar(
-    activity: dict,
-    semester_start: datetime,
-    semester_end: datetime,
+    activity: Dict,
+    start: datetime,
+    end: datetime,
 ) -> None:
     """
     Plot a GitHub-style daily activity heatmap over the semester.
@@ -482,8 +679,8 @@ def plot_semester_activity_calendar(
         print("No activity to plot.")
         return None
 
-    start = pd.to_datetime(semester_start)
-    end = pd.to_datetime(semester_end)
+    start = pd.to_datetime(start)
+    end = pd.to_datetime(end)
 
     all_days = pd.date_range(start=start, end=end, freq="D")
 
@@ -506,6 +703,7 @@ def plot_semester_activity_calendar(
         .fillna(0)
     )
 
+    # Monday labels for each week
     week_mondays = [
         (start + pd.Timedelta(days=7 * w)).date()
         for w in calendar.index
@@ -530,10 +728,11 @@ def plot_semester_activity_calendar(
     ax.set_xlabel("Day of Week")
     ax.set_ylabel("Week Starting (Monday)")
     ax.set_title(
-        f"Semester GitHub Activity Heatmap: {activity['username']}"
+        f"Semester Activity Heatmap: {activity['username']}"
     )
 
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("Activity Count")
 
     plt.tight_layout()
+    plt.show()
